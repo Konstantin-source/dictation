@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 import time
+import random
 import tkinter as tk
 from tkinter import messagebox
 import numpy as np
@@ -103,7 +104,7 @@ class DictationApp:
         
         # Setup GUI Window Properties
         self.root.title("GedankenDiktat")
-        self.root.configure(bg="#121214")
+        self.root.configure(bg="#0B0C0E") # Deeper dark color
         
         # Position in top-right corner of screen
         window_width = 460
@@ -127,6 +128,10 @@ class DictationApp:
         self.sample_rate = 16000 # Whisper expects 16kHz
         self.recording = True
         self.recording_duration = 0.0
+        
+        # Visualizer variables
+        self.current_volume = 0.0
+        self.smooth_volume = 0.0
         
         # Dynamic chunking queues
         self.transcription_queue = queue.Queue()
@@ -172,8 +177,6 @@ class DictationApp:
         
         # Start timers and animations
         self.update_timer()
-        self.pulse_radius = 16
-        self.pulse_direction = 1
         self.animate_recording()
 
     def start_drag(self, event):
@@ -186,31 +189,31 @@ class DictationApp:
         self.root.geometry(f"+{x}+{y}")
 
     def setup_ui(self):
-        # Outer border frame
-        self.border_frame = tk.Frame(self.root, bg="#2E2E35", bd=2)
+        # Outer border frame (sleek premium gray border)
+        self.border_frame = tk.Frame(self.root, bg="#23252E", bd=1)
         self.border_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         
         # Inner content frame
-        self.content_frame = tk.Frame(self.border_frame, bg="#121214")
-        self.content_frame.place(relx=0.01, rely=0.01, relwidth=0.98, relheight=0.98)
+        self.content_frame = tk.Frame(self.border_frame, bg="#0B0C0E")
+        self.content_frame.place(relx=0.005, rely=0.01, relwidth=0.99, relheight=0.98)
         
         # Close button in the top right
-        self.close_btn = tk.Label(self.content_frame, text="✕", fg="#6E6E73", bg="#121214", font=("Segoe UI", 11, "bold"), cursor="hand2")
+        self.close_btn = tk.Label(self.content_frame, text="✕", fg="#6E6E73", bg="#0B0C0E", font=("Segoe UI", 11, "bold"), cursor="hand2")
         self.close_btn.place(x=420, y=10)
         self.close_btn.bind("<Button-1>", lambda e: self.cancel())
         self.close_btn.bind("<Enter>", lambda e: self.close_btn.configure(fg="#FF453A"))
         self.close_btn.bind("<Leave>", lambda e: self.close_btn.configure(fg="#6E6E73"))
         
-        # Canvas for animated indicator (pulse / spinner)
-        self.canvas = tk.Canvas(self.content_frame, width=80, height=80, bg="#121214", bd=0, highlightthickness=0)
+        # Canvas for dynamic volume visualizer / processing spinner
+        self.canvas = tk.Canvas(self.content_frame, width=120, height=80, bg="#0B0C0E", bd=0, highlightthickness=0)
         self.canvas.pack(pady=(25, 5))
         
         # Status Label
-        self.status_label = tk.Label(self.content_frame, text="Gedanken aufnehmen...", fg="#FFFFFF", bg="#121214", font=("Segoe UI", 15, "bold"))
+        self.status_label = tk.Label(self.content_frame, text="Gedanken aufnehmen...", fg="#FFFFFF", bg="#0B0C0E", font=("Segoe UI", 15, "bold"))
         self.status_label.pack(pady=5)
         
         # Timer / Info Label
-        self.info_label = tk.Label(self.content_frame, text="00:00", fg="#8E8E93", bg="#121214", font=("Segoe UI", 11))
+        self.info_label = tk.Label(self.content_frame, text="00:00", fg="#8E8E93", bg="#0B0C0E", font=("Segoe UI", 11))
         self.info_label.pack()
         
         # Shortcuts / Help footer
@@ -218,7 +221,7 @@ class DictationApp:
             self.content_frame, 
             text="[Leertaste / Enter] Fertig  |  [Esc] Abbrechen", 
             fg="#545458", 
-            bg="#121214", 
+            bg="#0B0C0E", 
             font=("Segoe UI", 9)
         )
         self.footer_label.pack(side="bottom", pady=(0, 15))
@@ -248,17 +251,16 @@ class DictationApp:
             self.current_segment_chunks.append(chunk_copy)
             self.current_segment_length += len(chunk_copy)
             
-            # Calculate volume level (RMS) to detect pause/silence
+            # Calculate volume level (RMS)
             rms = np.sqrt(np.mean(chunk_copy**2)) if len(chunk_copy) > 0 else 0.0
+            self.current_volume = rms
             
             if rms < self.silence_threshold:
                 self.silence_samples_counter += len(chunk_copy)
             else:
                 self.silence_samples_counter = 0
                 
-            # Check cut conditions:
-            # A: Silence detected (e.g. 0.8s) AND we have enough audio (at least 3.0 seconds)
-            # B: Max segment length reached (e.g. 15s)
+            # Check cut conditions
             silence_triggered = (self.silence_samples_counter >= self.silence_limit_samples) and (self.current_segment_length >= 3.0 * self.sample_rate)
             length_triggered = self.current_segment_length >= self.max_segment_samples
             
@@ -266,7 +268,6 @@ class DictationApp:
                 self.push_current_segment()
 
     def push_current_segment(self):
-        # Assumes caller has acquired self.lock
         if not self.current_segment_chunks:
             return
             
@@ -281,14 +282,12 @@ class DictationApp:
         if len(segment_audio) > 0:
             idx = self.chunk_index
             self.chunk_index += 1
-            # Push segment audio to queue
             self.transcription_queue.put((idx, segment_audio))
 
     def load_whisper_model(self):
         try:
             from faster_whisper import WhisperModel
             model_size = self.config.get("model_size", "small")
-            # Run model loading on CPU, int8 for speed/memory efficiency.
             self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
             self.model_loaded.set()
         except Exception as e:
@@ -299,7 +298,6 @@ class DictationApp:
         while True:
             item = self.transcription_queue.get()
             if item is None:
-                # None is the shutdown sentinel
                 break
                 
             idx, audio_data = item
@@ -312,15 +310,13 @@ class DictationApp:
                 if self.model_load_error:
                     raise self.model_load_error
                 
-                # Context continuation prompting:
-                # Prepend previously transcribed text to the base initial prompt
+                # Context prompting
                 base_prompt = self.config.get("initial_prompt", "")
                 if self.previous_transcribed_text:
                     combined_prompt = f"{base_prompt} Previously: {self.previous_transcribed_text}"
                 else:
                     combined_prompt = base_prompt
                 
-                # Perform Whisper transcription
                 segments, info = self.model.transcribe(
                     audio_data,
                     language=self.config.get("language", "de"),
@@ -328,8 +324,6 @@ class DictationApp:
                     vad_filter=self.config.get("vad_filter", True)
                 )
                 text = "".join([segment.text for segment in segments]).strip()
-                
-                # Store text at index
                 self.segment_texts[idx] = text
                 
                 if text:
@@ -354,24 +348,48 @@ class DictationApp:
             return
             
         self.canvas.delete("all")
-        cx, cy = 40, 40
         
-        self.pulse_radius += 0.8 * self.pulse_direction
-        if self.pulse_radius >= 32:
-            self.pulse_direction = -1
-        elif self.pulse_radius <= 16:
-            self.pulse_direction = 1
+        # Smooth volume transition
+        self.smooth_volume = self.smooth_volume * 0.7 + self.current_volume * 0.3
+        
+        # Canvas dimensions are 120x80. Center is (60, 40)
+        cx, cy = 60, 40
+        
+        # 1. Glowing red backdrop pulsing with volume
+        glow_r = 18 + min(self.smooth_volume * 150, 22)
+        self.canvas.create_oval(cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r, 
+                                fill="#2A0B0F", outline="")
+        
+        # 2. Draw 7 dancing equalizer bars
+        # Total width: 7 bars of 6px with 4px gaps = 66px
+        x_start = cx - 33
+        bar_width = 6
+        gap = 4
+        
+        base_h = 6
+        max_h = 44
+        
+        # Center bars respond more dynamically than side bars
+        multipliers = [0.4, 0.7, 1.1, 1.4, 1.1, 0.7, 0.4]
+        
+        for i in range(7):
+            # Scale volume RMS (typically 0.0 - 0.1 for speech, max out around 0.15)
+            volume_scale = min(self.smooth_volume * 180, 1.0)
             
-        opacity_factor = int((32 - self.pulse_radius) / 16 * 80) + 20
-        red_val = int(40 + (self.pulse_radius - 16) * 4)
-        glow_color = f"#{red_val:02x}1515"
-        
-        self.canvas.create_oval(cx - self.pulse_radius, cy - self.pulse_radius, 
-                                cx + self.pulse_radius, cy + self.pulse_radius, 
-                                fill=glow_color, outline="")
-                                
-        self.canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, fill="#FF3B30", outline="")
-        
+            # Subtle random flicker to keep visualizer "alive" even when silent
+            flicker = random.uniform(0.0, 1.5)
+            h = base_h + (volume_scale * multipliers[i] * (max_h - base_h)) + flicker
+            h = min(h, max_h)
+            
+            # Draw line with rounded cap to form a pill shape
+            x = x_start + i * (bar_width + gap) + (bar_width / 2)
+            y1 = cy - (h / 2)
+            y2 = cy + (h / 2)
+            
+            # Color is a sleek gradient: base red #FF375F, top orange #FF9F0A
+            # We can use modern vibrant coral red (#FF453A)
+            self.canvas.create_line(x, y1, x, y2, fill="#FF453A", width=bar_width, capstyle="round")
+                                    
         self.root.after(30, self.animate_recording)
 
     def animate_transcribing(self, angle=0):
@@ -379,8 +397,9 @@ class DictationApp:
             return
             
         self.canvas.delete("all")
-        cx, cy = 40, 40
+        cx, cy = 60, 40
         
+        # Draw rotating blue arc spinner
         self.canvas.create_arc(cx - 20, cy - 20, cx + 20, cy + 20, 
                                start=angle, extent=80, 
                                outline="#0A84FF", width=3, style="arc")
@@ -396,17 +415,17 @@ class DictationApp:
             return
         self.recording = False
         
-        # Stop audio stream
+        # Stop stream
         if hasattr(self, 'stream') and self.stream.active:
             self.stream.stop()
             self.stream.close()
             
-        # Push remaining audio buffer to queue
+        # Push remaining audio buffer
         with self.lock:
             if self.current_segment_chunks:
                 self.push_current_segment()
                 
-        # Send shutdown sentinel to worker queue
+        # Send shutdown sentinel
         self.transcription_queue.put(None)
 
         # Switch GUI to Transcribing state
@@ -416,7 +435,7 @@ class DictationApp:
         self.footer_label.configure(text="Bitte warten...")
         self.animate_transcribing()
         
-        # Finish transcription on separate thread
+        # Finish transcription in background thread
         threading.Thread(target=self.finish_transcription, daemon=True).start()
 
     def cancel(self):
@@ -429,10 +448,8 @@ class DictationApp:
 
     def finish_transcription(self):
         try:
-            # Wait for all background transcription chunks to complete
             self.worker_thread.join()
             
-            # Combine all chunk texts in order of index
             ordered_texts = []
             for i in range(self.chunk_index):
                 text = self.segment_texts.get(i, "")
@@ -440,8 +457,6 @@ class DictationApp:
                     ordered_texts.append(text)
                     
             final_text = " ".join(ordered_texts).strip()
-            
-            # Remove double spaces
             final_text = " ".join(final_text.split())
             
             if final_text:
@@ -460,7 +475,7 @@ class DictationApp:
         self.transcribing_active = False
         self.canvas.delete("all")
         
-        cx, cy = 40, 40
+        cx, cy = 60, 40
         self.canvas.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#30D158", outline="")
         self.canvas.create_line(cx - 10, cy, cx - 3, cy + 7, fill="#FFFFFF", width=3, capstyle="round")
         self.canvas.create_line(cx - 3, cy + 7, cx + 10, cy - 7, fill="#FFFFFF", width=3, capstyle="round")
@@ -480,7 +495,7 @@ class DictationApp:
         self.transcribing_active = False
         self.canvas.delete("all")
         
-        cx, cy = 40, 40
+        cx, cy = 60, 40
         self.canvas.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#FF453A", outline="")
         self.canvas.create_line(cx - 8, cy - 8, cx + 8, cy + 8, fill="#FFFFFF", width=3, capstyle="round")
         self.canvas.create_line(cx - 8, cy + 8, cx + 8, cy - 8, fill="#FFFFFF", width=3, capstyle="round")
