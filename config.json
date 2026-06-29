@@ -1,0 +1,9 @@
+{
+  "model_size": "small",
+  "language": "de",
+  "hotkey": "Ctrl+Alt+J",
+  "auto_exit_delay_ms": 1500,
+  "theme": "dark",
+  "vad_filter": true,
+  "initial_prompt": "Diktat auf Deutsch, enthält Software-Entwicklungs-Begriffe wie: git, commit, branch, push, pull request, merge, frontend, backend, refactoring, API, bug, code, deploy, database, pipeline, function, class, variable, loop, array, json, python."
+}
