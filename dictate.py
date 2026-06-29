@@ -18,7 +18,10 @@ DEFAULT_CONFIG = {
     "auto_exit_delay_ms": 1500,
     "theme": "dark",
     "vad_filter": True,
-    "initial_prompt": "Diktat auf Deutsch, enthält Software-Entwicklungs-Begriffe wie: git, commit, branch, push, pull request, merge, frontend, backend, refactoring, API, bug, code, deploy, database, pipeline, function, class, variable, loop, array, json, python."
+    "initial_prompt": "Diktat auf Deutsch, enthält Software-Entwicklungs-Begriffe wie: git, commit, branch, push, pull request, merge, frontend, backend, refactoring, API, bug, code, deploy, database, pipeline, function, class, variable, loop, array, json, python.",
+    "silence_threshold": 0.015,
+    "silence_duration_sec": 0.8,
+    "max_chunk_duration_sec": 15.0
 }
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -96,12 +99,13 @@ class DictationApp:
     def __init__(self, root, config):
         self.root = root
         self.config = config
+        self.lock = threading.Lock()
         
         # Setup GUI Window Properties
         self.root.title("GedankenDiktat")
         self.root.configure(bg="#121214")
         
-        # Center borderless window
+        # Position in top-right corner of screen
         window_width = 460
         window_height = 240
         self.root.overrideredirect(True) # Make it borderless
@@ -109,20 +113,38 @@ class DictationApp:
         
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = (screen_width - window_width) // 2
-        y = (screen_height - window_height) // 2
+        margin_x = 30
+        margin_y = 50  # below the top edge
+        x = screen_width - window_width - margin_x
+        y = margin_y
         self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         
-        # Bind Drag events to allow moving the borderless window
+        # Bind Drag events to allow moving the window
         self.root.bind("<Button-1>", self.start_drag)
         self.root.bind("<B1-Motion>", self.drag)
         
-        # Audio recording variables
+        # Audio recording & chunking variables
         self.sample_rate = 16000 # Whisper expects 16kHz
-        self.audio_queue = queue.Queue()
         self.recording = True
-        self.recorded_audio = None
         self.recording_duration = 0.0
+        
+        # Dynamic chunking queues
+        self.transcription_queue = queue.Queue()
+        self.chunk_index = 0
+        self.segment_texts = {} # dict mapping index -> text
+        
+        # Audio buffers for the current active chunk
+        self.current_segment_chunks = []
+        self.current_segment_length = 0 # in samples
+        
+        # Silence detection parameters from config
+        self.silence_threshold = self.config.get("silence_threshold", 0.015)
+        self.silence_limit_samples = int(self.config.get("silence_duration_sec", 0.8) * self.sample_rate)
+        self.max_segment_samples = int(self.config.get("max_chunk_duration_sec", 15.0) * self.sample_rate)
+        self.silence_samples_counter = 0
+        
+        # Track previous transcribed text to use as prompt context
+        self.previous_transcribed_text = ""
         
         # Background Whisper model loading
         self.model = None
@@ -132,6 +154,10 @@ class DictationApp:
         # Start background model loading
         self.model_thread = threading.Thread(target=self.load_whisper_model, daemon=True)
         self.model_thread.start()
+        
+        # Start background queue transcriber
+        self.worker_thread = threading.Thread(target=self.transcription_queue_worker, daemon=True)
+        self.worker_thread.start()
         
         # Setup UI elements
         self.setup_ui()
@@ -213,18 +239,107 @@ class DictationApp:
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             print(f"Audio recording status warning: {status}", file=sys.stderr)
-        self.audio_queue.put(indata.copy())
+        
+        if not self.recording:
+            return
+            
+        with self.lock:
+            chunk_copy = indata.copy()
+            self.current_segment_chunks.append(chunk_copy)
+            self.current_segment_length += len(chunk_copy)
+            
+            # Calculate volume level (RMS) to detect pause/silence
+            rms = np.sqrt(np.mean(chunk_copy**2)) if len(chunk_copy) > 0 else 0.0
+            
+            if rms < self.silence_threshold:
+                self.silence_samples_counter += len(chunk_copy)
+            else:
+                self.silence_samples_counter = 0
+                
+            # Check cut conditions:
+            # A: Silence detected (e.g. 0.8s) AND we have enough audio (at least 3.0 seconds)
+            # B: Max segment length reached (e.g. 15s)
+            silence_triggered = (self.silence_samples_counter >= self.silence_limit_samples) and (self.current_segment_length >= 3.0 * self.sample_rate)
+            length_triggered = self.current_segment_length >= self.max_segment_samples
+            
+            if silence_triggered or length_triggered:
+                self.push_current_segment()
+
+    def push_current_segment(self):
+        # Assumes caller has acquired self.lock
+        if not self.current_segment_chunks:
+            return
+            
+        # Concatenate audio chunks
+        segment_audio = np.concatenate(self.current_segment_chunks, axis=0).flatten()
+        
+        # Reset counters
+        self.current_segment_chunks = []
+        self.current_segment_length = 0
+        self.silence_samples_counter = 0
+        
+        if len(segment_audio) > 0:
+            idx = self.chunk_index
+            self.chunk_index += 1
+            # Push segment audio to queue
+            self.transcription_queue.put((idx, segment_audio))
 
     def load_whisper_model(self):
         try:
             from faster_whisper import WhisperModel
-            model_size = self.config.get("model_size", "base")
-            # Run model loading on CPU, int8 for maximum speed/memory efficiency on average machines.
+            model_size = self.config.get("model_size", "small")
+            # Run model loading on CPU, int8 for speed/memory efficiency.
             self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
             self.model_loaded.set()
         except Exception as e:
             self.model_load_error = e
             self.model_loaded.set()
+
+    def transcription_queue_worker(self):
+        while True:
+            item = self.transcription_queue.get()
+            if item is None:
+                # None is the shutdown sentinel
+                break
+                
+            idx, audio_data = item
+            
+            try:
+                # Wait for model load
+                if not self.model_loaded.is_set():
+                    self.model_loaded.wait()
+                    
+                if self.model_load_error:
+                    raise self.model_load_error
+                
+                # Context continuation prompting:
+                # Prepend previously transcribed text to the base initial prompt
+                base_prompt = self.config.get("initial_prompt", "")
+                if self.previous_transcribed_text:
+                    combined_prompt = f"{base_prompt} Previously: {self.previous_transcribed_text}"
+                else:
+                    combined_prompt = base_prompt
+                
+                # Perform Whisper transcription
+                segments, info = self.model.transcribe(
+                    audio_data,
+                    language=self.config.get("language", "de"),
+                    initial_prompt=combined_prompt,
+                    vad_filter=self.config.get("vad_filter", True)
+                )
+                text = "".join([segment.text for segment in segments]).strip()
+                
+                # Store text at index
+                self.segment_texts[idx] = text
+                
+                if text:
+                    self.previous_transcribed_text = text
+                    
+            except Exception as e:
+                print(f"Error transcribing chunk {idx}: {e}", file=sys.stderr)
+                self.segment_texts[idx] = ""
+                
+            self.transcription_queue.task_done()
 
     def update_timer(self):
         if self.recording:
@@ -239,30 +354,22 @@ class DictationApp:
             return
             
         self.canvas.delete("all")
-        
-        # Center of canvas
         cx, cy = 40, 40
         
-        # Pulsing outer ring (glow)
-        # Radius goes from 16 to 34
         self.pulse_radius += 0.8 * self.pulse_direction
         if self.pulse_radius >= 32:
             self.pulse_direction = -1
         elif self.pulse_radius <= 16:
             self.pulse_direction = 1
             
-        # Draw background ring (semi-transparent simulator by using a dark red tone on dark bg)
-        # Interpolate color based on size to fade out
         opacity_factor = int((32 - self.pulse_radius) / 16 * 80) + 20
-        # Color hex: higher radius -> darker red
-        red_val = int(40 + (self.pulse_radius - 16) * 4) # 40 to 104
+        red_val = int(40 + (self.pulse_radius - 16) * 4)
         glow_color = f"#{red_val:02x}1515"
         
         self.canvas.create_oval(cx - self.pulse_radius, cy - self.pulse_radius, 
                                 cx + self.pulse_radius, cy + self.pulse_radius, 
                                 fill=glow_color, outline="")
                                 
-        # Draw central solid red recording dot
         self.canvas.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, fill="#FF3B30", outline="")
         
         self.root.after(30, self.animate_recording)
@@ -274,7 +381,6 @@ class DictationApp:
         self.canvas.delete("all")
         cx, cy = 40, 40
         
-        # Draw rotating blue arc spinner
         self.canvas.create_arc(cx - 20, cy - 20, cx + 20, cy + 20, 
                                start=angle, extent=80, 
                                outline="#0A84FF", width=3, style="arc")
@@ -295,25 +401,23 @@ class DictationApp:
             self.stream.stop()
             self.stream.close()
             
-        # Gather all recorded audio data from queue
-        audio_chunks = []
-        while not self.audio_queue.empty():
-            audio_chunks.append(self.audio_queue.get())
-            
-        if len(audio_chunks) > 0:
-            self.recorded_audio = np.concatenate(audio_chunks, axis=0).flatten()
-        else:
-            self.recorded_audio = np.array([], dtype='float32')
+        # Push remaining audio buffer to queue
+        with self.lock:
+            if self.current_segment_chunks:
+                self.push_current_segment()
+                
+        # Send shutdown sentinel to worker queue
+        self.transcription_queue.put(None)
 
         # Switch GUI to Transcribing state
         self.transcribing_active = True
         self.status_label.configure(text="Verarbeite Gedanken...")
-        self.info_label.configure(text="Transkription wird vorbereitet...")
+        self.info_label.configure(text="Transkription wird abgeschlossen...")
         self.footer_label.configure(text="Bitte warten...")
         self.animate_transcribing()
         
-        # Run transcription in a background thread to prevent UI freezing
-        threading.Thread(target=self.transcribe_process, daemon=True).start()
+        # Finish transcription on separate thread
+        threading.Thread(target=self.finish_transcription, daemon=True).start()
 
     def cancel(self):
         self.recording = False
@@ -323,37 +427,26 @@ class DictationApp:
         self.root.destroy()
         sys.exit(0)
 
-    def transcribe_process(self):
+    def finish_transcription(self):
         try:
-            # Step 1: Wait for Whisper model to finish loading if not done
-            if not self.model_loaded.is_set():
-                self.root.after(0, self.update_info_text, "Modell wird geladen...")
-                self.model_loaded.wait()
-                
-            if self.model_load_error:
-                raise self.model_load_error
-                
-            if self.recorded_audio is None or len(self.recorded_audio) < self.sample_rate * 0.5:
-                # Less than 0.5s of recording
-                self.root.after(0, self.show_error, "Zu kurz aufgenommen.")
-                return
-
-            self.root.after(0, self.update_info_text, "Transkribiere...")
+            # Wait for all background transcription chunks to complete
+            self.worker_thread.join()
             
-            # Step 2: Perform transcription
-            segments, info = self.model.transcribe(
-                self.recorded_audio,
-                language=self.config.get("language", "de"),
-                initial_prompt=self.config.get("initial_prompt", ""),
-                vad_filter=self.config.get("vad_filter", True)
-            )
+            # Combine all chunk texts in order of index
+            ordered_texts = []
+            for i in range(self.chunk_index):
+                text = self.segment_texts.get(i, "")
+                if text:
+                    ordered_texts.append(text)
+                    
+            final_text = " ".join(ordered_texts).strip()
             
-            transcribed_text = "".join([segment.text for segment in segments]).strip()
+            # Remove double spaces
+            final_text = " ".join(final_text.split())
             
-            if transcribed_text:
-                # Copy result to clipboard
-                pyperclip.copy(transcribed_text)
-                self.root.after(0, self.show_success, transcribed_text)
+            if final_text:
+                pyperclip.copy(final_text)
+                self.root.after(0, self.show_success, final_text)
             else:
                 self.root.after(0, self.show_error, "Keine Sprache erkannt.")
                 
@@ -367,7 +460,6 @@ class DictationApp:
         self.transcribing_active = False
         self.canvas.delete("all")
         
-        # Draw green checkmark icon
         cx, cy = 40, 40
         self.canvas.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#30D158", outline="")
         self.canvas.create_line(cx - 10, cy, cx - 3, cy + 7, fill="#FFFFFF", width=3, capstyle="round")
@@ -375,14 +467,12 @@ class DictationApp:
         
         self.status_label.configure(text="In Zwischenablage kopiert!")
         
-        # Display preview of text (truncated if long)
         preview_text = text
         if len(preview_text) > 40:
             preview_text = preview_text[:37] + "..."
         self.info_label.configure(text=f'"{preview_text}"', fg="#30D158")
         self.footer_label.configure(text="Schließen...")
         
-        # Auto close window
         delay = self.config.get("auto_exit_delay_ms", 1500)
         self.root.after(delay, self.close_app)
 
@@ -390,7 +480,6 @@ class DictationApp:
         self.transcribing_active = False
         self.canvas.delete("all")
         
-        # Draw red warning/error cross icon
         cx, cy = 40, 40
         self.canvas.create_oval(cx - 20, cy - 20, cx + 20, cy + 20, fill="#FF453A", outline="")
         self.canvas.create_line(cx - 8, cy - 8, cx + 8, cy + 8, fill="#FFFFFF", width=3, capstyle="round")
@@ -398,7 +487,6 @@ class DictationApp:
         
         self.status_label.configure(text="Abgebrochen / Fehler")
         
-        # Show short message
         lines = error_message.split("\n")
         short_err = lines[0]
         if len(short_err) > 45:
@@ -406,7 +494,6 @@ class DictationApp:
         self.info_label.configure(text=short_err, fg="#FF453A")
         self.footer_label.configure(text="Fenster schließt sich...")
         
-        # Wait longer for error reading (3 seconds)
         self.root.after(3000, self.close_app)
 
     def close_app(self):
